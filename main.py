@@ -5,23 +5,29 @@ import setup
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import functools
-import globals  # Import the globals module
+import globals
+import os  # Required for Cloud Run PORT
 
 app = FastAPI()
 
-# Create a thread pool executor
-thread_pool = ThreadPoolExecutor(max_workers=10)
+# Create a thread pool executor (reduced workers for Cloud Run limits)
+thread_pool = ThreadPoolExecutor(max_workers=2)  # Reduced from 10 for free tier
 
+# CORS Configuration - Updated for security
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://www.ea.com",
+        "https://ea.com",
+        "http://localhost:8000"  # For local testing
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
 def run_in_threadpool(func):
-    """Decorator to run a function in a thread pool"""
+    """Decorator to run blocking functions in threadpool"""
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
         loop = asyncio.get_event_loop()
@@ -31,60 +37,53 @@ def run_in_threadpool(func):
         )
     return wrapper
 
-# Synchronous function that will be run in a thread
-def get_logs():
-    # Return the logs from the shared module
-    return {"logs": globals.solver_logs}
+# Health check endpoint (required for Cloud Run)
+@app.get("/")
+async def health_check():
+    return {"status": "healthy", "service": "EAFC SBC Solver"}
 
 @app.get('/solver-logs')
 async def get_solver_logs():
-    # Run the blocking operation in a separate thread
-    return await run_in_threadpool(get_logs)()
-
-# Synchronous function that will be run in a thread
-def process_solve_request(request_data):
-    # Use the globals module
-    globals.clear_logs()  # Clear previous logs
-    globals.add_log("SBC Solver started in thread")
-    
-    sbcData = request_data['sbcData']
-    clubPlayers = request_data['clubPlayers']
-    maxSolveTime = request_data['maxSolveTime']
-    
-    # Log received data
-    globals.add_log(f"Processing {len(clubPlayers)} players, max time: {maxSolveTime}s")
-    
-    try:
-        result = setup.runAutoSBC(sbcData, clubPlayers, maxSolveTime)
-        
-        # Log completion
-        globals.add_log("Solver thread completed successfully")
-        
-        return result
-    except Exception as e:
-        # Log errors
-        globals.add_log(f"Error in solver thread: {str(e)}")
-        raise e
+    return await run_in_threadpool(lambda: {"logs": globals.solver_logs})()
 
 @app.post('/solve')
-async def get_body(request: Request):
-    # Parse the request data and clear logs on new solve
-    request_data = await request.json()
-    
-    # Run the CPU-intensive task in a thread pool
-    result = await run_in_threadpool(process_solve_request)(request_data)
-    return result
+async def solve_sbc(request: Request):
+    try:
+        request_data = await request.json()
+        result = await run_in_threadpool(process_solve_request)(request_data)
+        return result
+    except Exception as e:
+        globals.add_log(f"API Error: {str(e)}")
+        return {"error": str(e)}, 500
 
-# Add endpoint to clear logs in a separate thread
-def clear_logs_handler():
+def process_solve_request(request_data):
+    """Synchronous processing function"""
     globals.clear_logs()
-    return {"status": "success"}
+    globals.add_log("Solver started")
+    
+    try:
+        result = setup.runAutoSBC(
+            request_data['sbcData'],
+            request_data['clubPlayers'],
+            request_data['maxSolveTime']
+        )
+        globals.add_log("Solver completed")
+        return result
+    except Exception as e:
+        globals.add_log(f"Solver error: {str(e)}")
+        raise
 
 @app.post('/clear-logs')
-async def clear_solver_logs():
-    return await run_in_threadpool(clear_logs_handler)()
+async def clear_logs():
+    return await run_in_threadpool(globals.clear_logs)()
 
-# Graceful shutdown
 @app.on_event("shutdown")
-def shutdown_event():
-    thread_pool.shutdown(wait=True)
+async def shutdown_event():
+    """Cleanup during shutdown"""
+    thread_pool.shutdown(wait=False)
+    globals.add_log("Service shutting down")
+
+# Cloud Run entry point
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, workers=1)
